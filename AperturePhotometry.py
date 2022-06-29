@@ -8,37 +8,46 @@ Created on Wed Aug 11 13:20:12 2021
 
 This is the base version of the code used to perform relative photometry 
 I have tried to comment on anything you could need to change to get the program functionning.
-You will need the modules os, astropy, numpy, math, gc and photutils 
+You will need the modules os, astropy, numpy, math, gc, resource, matplotlib, and photutils 
 
 This is the current working version, in glorious module format
-As long as this file is saved int he same directory as you are working in, you can call this code
+As long as this file is saved in the same directory as you are working in, you can call this code
 This drastically simplifies things!
+
+If you don't want to do that, you can also just change the working directory in the code using 
+the os module. Just import os, change the directory to where this file is saved, import the file/module,
+then change it to where you want. 
 
 If you have any questions, feel free to email me at jakemiller.wsu@gmail.com
 
 TIPS AND TRICKS:
+    You can input as many stars as you like. It will keep track of the stars used separately.
+    
+    There is a memory leak that comes from phot.DAOStarFinder. This has been reported to the devs.
+    The memory leak is greater if the fits images you are using are bigger.
+    This depends on your setup obviously, but for my system it ran out of memory and crashed my computer
+    after approximately 1600 Zowada files (33.8 MB each) processed. This was never an issue with other,
+    smaller fits files.
+    
+    This code produces 3 files at the end - one for the counts, one for the errors on those counts,
+    and finally the file usage diagnostics. You can turn off producing the first two or the last one in
+    the optional kwargs. You could in theory produce nothing, but who would do that?
+    
+    
+    
+    
     *Multiple Detections on Stars/Object:
         -Raise background (default is 3*std of night sky)
         -Put a lower limit on total_stars (default is 2000, trying lowering)
-        -If above keeps failing, consider new stars
     *No Detections on Stars/Object:
         -First, try raising total_stars
         -If you are not detecting up to the limit set by total_stars, lower background
         -DO NOT lower background without changing total_stars. This will just make it 
         run longer without actually changing any parameters, since it will still detect the 
         same brightest stars, just at a much lower speed.
+Definition of input parameters below...
 """
-"""
-def AperturePhotometry (thresh, background, radius,
-                        rin, rout, timesep, filter_list,
-                        RA_list, Dec_list, obj_name,
-                        detect_scopes, scope_name,
-                        directory, save_directory, file_ending,
-                        header_index, h_scopename, h_filter, 
-                        h_fwhm, h_exposure, h_date, 
-                        h_JD, h_HJD, h_pixscale, h_gain,
-                        save_text, use_HJD, verbose, **kwargs):
-"""
+
 
 def AperturePhotometry (thresh, background, radius,
                         filter_list, RA_list, Dec_list, obj_name,
@@ -65,11 +74,14 @@ def AperturePhotometry (thresh, background, radius,
     from astropy.visualization import SqrtStretch
     from astropy.visualization.mpl_normalize import ImageNormalize
     from photutils.aperture import CircularAperture
+    from astropy.stats import SigmaClip
+    from photutils.background import MMMBackground
+    from photutils.background import StdBackgroundRMS
     import matplotlib.pyplot as plt
     
     detect_scopes = kwargs.get('detect_scopes', False) #If you want the program to try and detect telescopes used, turn this to True.
-    rin = kwargs.get('rin', 18) #Inner radius of annulus for background subtraction
-    rout = kwargs.get('rout', 27) #Out radius of annulus for background subtraction
+    rin = kwargs.get('rin', 20) #Inner radius of annulus for background subtraction
+    rout = kwargs.get('rout', 30) #Out radius of annulus for background subtraction
     timesep = kwargs.get('timesep', 0.128) #Length of time between observations (in JD) to warrant splitting a night of observations into two data points. By default, is around 3 hours
     file_ending = kwargs.get('file_ending', '') #If for some reason you want to add some form of text to the ends of the saved files, add this parameter
     header_index = kwargs.get('header_index', 0) #The header index where both the data and header keywords are stored. By default is 0, which is true for Zowada
@@ -78,7 +90,7 @@ def AperturePhotometry (thresh, background, radius,
     h_exposure = kwargs.get('h_exposure',"EXPOSURE")#header keyword for image exposure
     h_date = kwargs.get('h_date',"DATE")#A date (like 01/01/2001), used for  image categorization
     h_JD = kwargs.get('h_JD',"JD")#Julian date of image observation
-    h_HJD = kwargs.get('h_HJD',"HJD")#HJD date of image observation. If not doing HJD, can put whatever (even just '')
+    h_HJD = kwargs.get('h_HJD',"HJD-OBS")#HJD date of image observation. If not doing HJD, can put whatever (even just '')
     h_scopename = kwargs.get('h_scopename', '')#if you are detecting what telescope was used to take the image, put the header keyword for that here. Otherwise, put whatever.
     h_pixscale = kwargs.get('h_pixscale',0.89) #the pixelscale (pixels/arcsec). Can be given a header keyword if in the header, or the actual number if you know it.
     h_gain = kwargs.get('h_gain',1.85) #The gain of the image. Similar to pixscale, it can be given a header keyword to draw from or the actual number if you know it.
@@ -93,9 +105,20 @@ def AperturePhotometry (thresh, background, radius,
     list2load = kwargs.get('list2load', []) #Given load_list is true, this should be a file that has the paths written out of all the files you want to use.
     debug = kwargs.get('debug', False) #mostly just for me, turn on some extra extra parameters to print out during the coding process
     num_tries = kwargs.get('num_tries', 3) #How many tries the code should run for an image before giving up. The code will adjust the FWHM/background after a try to see if it can get a detection.
-    
-    
-    
+    start_date = kwargs.get('start_date', 0) #What day (in MJD or HJD, depending on which system you are using) to start using the data. Default to 0, meaning every day is used.
+    end_date = kwargs.get('end_date', math.inf) #Similar to start_date, except its what day you want to include data up to. Defaults to infinite to include everything
+    find_keyword = kwargs.get('find_keyword', '') #If blank, tries to get all usable files in a directory. If set otherwise, then it will look for files in their names that contain the keyword given
+    load_stars = kwargs.get('load_stars', '') #if blank, assumes you loaded the stars from the AP page. If provided with a path to the file, will load those stars. You still need to provide object RA and Dec
+    if len(load_stars) > 0:
+        object_RA, object_Dec = RA_list[0], Dec_list[0]
+        RA_list, Dec_list = [], []
+        RA_list.append(object_RA)
+        Dec_list.append(object_Dec)
+        Star_file = open(load_stars, 'r')
+        for row in Star_file:
+            row = row.split()
+            RA_list.append(float(row[0]))
+            Dec_list.append(float(row[1]))
     
     # Ammount of tolerance to find comparison stars in list of every star in image
     #Typical value is 3. Change if the program is having trouble finding a star.
@@ -107,7 +130,7 @@ def AperturePhotometry (thresh, background, radius,
     #If the program is having trouble finding the star, lower the value (3 is usually as low as I will go).
     #If it is finding too many stars, (mult_star is getting a hit) increase the background.
     background = background
-    
+    background_input = background
     #radius of aperture (in arcseconds) you use for the aperture photometry. Default value is 4.5, can also be done using a factor times the average FWHM of the series of images
     #Using star fwhm is probably slightly better, but 4.5 seems to work fine as a good default
     radius = radius
@@ -184,6 +207,9 @@ def AperturePhotometry (thresh, background, radius,
     h_gain = h_gain
     pixscale_found = False
     gain_found =False
+    
+    
+    
     if isinstance(h_pixscale, float): 
         pixscale_found = True
     if isinstance(h_gain, float): 
@@ -196,7 +222,11 @@ def AperturePhotometry (thresh, background, radius,
     
     #Verbose - if you want to print more details, put this to True
     v = verbose
-    
+    if save == False:
+        print('************ WARNING!!!! ************')
+        print("You are NOT SAVING THIS DATA!!!")
+        print("Double check that you want to do this!!!")
+        print('************ WARNING!!!! ************')
     #datesplit - Boolean. True if you want to split data between a telescope into two different files
     #date2split - JD date that you want to split
     #The reason this exists is for year 1 Zowada data, in case someone else looks at this
@@ -253,6 +283,7 @@ def AperturePhotometry (thresh, background, radius,
         for file in imported_files:
             Image = fits.open(file)
             JD = Image[hi].header[h_JD]
+            
             if detect_scopes:
                 scope = Image[hi].header[h_scopename]
             else:
@@ -292,6 +323,12 @@ def AperturePhotometry (thresh, background, radius,
         for folder in folder_list:
             try:
                 file_list = os.listdir(directory+folder)
+                print(file_list)
+                print(len(find_keyword))
+                print(find_keyword)
+                if len(find_keyword) > 0:
+                    file_list = [i for i in file_list if find_keyword in i]
+                    
                 file_list.sort()
                 for file in file_list:
                     if file.startswith('._'):
@@ -300,32 +337,35 @@ def AperturePhotometry (thresh, background, radius,
                     try:
                         Image = fits.open(directory + folder + '/' + file)
                         JD = Image[hi].header[h_JD]
-                        #print(JD)
-                        
-                        if detect_scopes:
-                            #if obj_name in year1_list and date <:
-                            scope = Image[hi].header[h_scopename]
-                        else:
-                            scope = scope_name
-                        if datesplit:
-                            if JD < date2split:
-                                scope = scope+'_1'
+                        datecheck = JD
+                        if use_HJD == True:
+                            HJD = Image[hi].header[h_HJD]
+                            datecheck = HJD
+                        if datecheck > start_date and datecheck < end_date:
+                            if detect_scopes:
+                                #if obj_name in year1_list and date <:
+                                scope = Image[hi].header[h_scopename]
                             else:
-                                scope = scope+'_2'
-                        
-                        filter1 = Image[hi].header[h_filter]
-                        if filter1 in use_filters:
-                            if v: print("Found:",file)
-                            if scope not in telescope_dict:
-                                telescope_dict[scope] = {}
-                
-                            if filter1 not in telescope_dict[scope]:
-                                telescope_dict[scope][filter1] = []
-                            telescope_dict[scope][filter1].append(directory + folder + '/' + file)
+                                scope = scope_name
+                            if datesplit:
+                                if JD < date2split:
+                                    scope = scope+'_1'
+                                else:
+                                    scope = scope+'_2'
                             
-                            if filter1 not in filter_list:
-                                filter_list.append(filter1)
-                        Image.close()
+                            filter1 = Image[hi].header[h_filter]
+                            if filter1 in use_filters:
+                                if v: print("Found:",file)
+                                if scope not in telescope_dict:
+                                    telescope_dict[scope] = {}
+                    
+                                if filter1 not in telescope_dict[scope]:
+                                    telescope_dict[scope][filter1] = []
+                                telescope_dict[scope][filter1].append(directory + folder + '/' + file)
+                                
+                                if filter1 not in filter_list:
+                                    filter_list.append(filter1)
+                        Image.close() 
                     except OSError:
                         if v:print(file, 'not a fits file.')
                     except KeyError:
@@ -391,6 +431,7 @@ def AperturePhotometry (thresh, background, radius,
             no_wcs_files = []
             total_files = 0
             multistar, nostar = [], []
+            
             for i in range(len(RAs)):
                 multistar.append([])
                 nostar.append([])
@@ -400,6 +441,7 @@ def AperturePhotometry (thresh, background, radius,
             #Dictionary that holds all dates that have not been excluded from the selection via previous testing
             #Currently not implemented
             #DOO_excluded = {}
+            
             if filt not in telescope_dict[telescope]:
                 print("This Telescope does not have any files in the", filt, "filter, skipping...")
                 good_files_list.append(good_files)
@@ -435,18 +477,19 @@ def AperturePhotometry (thresh, background, radius,
                 if date not in DOO:
                     DOO[date] = []
                     first_time = time
-                DOO[date].append(file)
-                """
+                #DOO[date].append(file)
+                
+                #Time separation code
+                #If 
+                if time - first_time < timesep:
+                    DOO[date].append(file)
                 else:
-                    if time - first_time < timesep:
-                        DOO[date].append(file)
-                    else:
-                        if date+'_2' not in DOO:
-                            if v:print("Observation found that is longer than", timesep, "days apart! Making a separate catagory for:")
-                            if v:print(date)
-                            DOO[date+'_2'] = []
-                        DOO[date+'_2'].append(file)
-                """
+                    if date+'_2' not in DOO:
+                        if v:print("Observation found that is longer than", timesep, "days apart! Making a separate catagory for:")
+                        if v:print(date)
+                        DOO[date+'_2'] = []
+                    DOO[date+'_2'].append(file)
+                
                 #try:
                 #    fwhm = Image[hi].header[h_fwhm]
                 #    fwhm_list.append(fwhm)
@@ -456,13 +499,28 @@ def AperturePhotometry (thresh, background, radius,
             total_epochs = len(DOO)
             print('')
             print("Total Files for", telescope, 'in the', filt, 'band:', total_files)
-            
+            if telescope == '2m0-01':
+                radius = 9
+                radius_2m = radius
+                r_in = 59
+                r_out = 89
+            elif telescope == '1m0-08' or telescope =='1m0-06':
+                radius = 11
+                radius_1m = radius
+                r_in = 46
+                r_out = 69
             #Create our output files in our save_directory, one for the count rates and one for the associated errors
-            Output_Phot = open(save_directory + obj_name + "_" + telescope+ "_" + filt + "_tol" + str(pixthresh) + "_background" + str(background) + "_radius" + str(radius) + file_ending+ ".dat", "w")
-            Output_Error = open(save_directory + obj_name + "_" + telescope+ "_" + filt + "_tol" + str(pixthresh) + "_background" + str(background) + "_radius" + str(radius) + file_ending+ "_Errors.dat", "w")
+            if use_HJD:
+                 Output_Phot = open(save_directory + obj_name + "_" + telescope+ "_" + filt + "_tol" + str(pixthresh) + "_background" + str(background_input) + "_radius" + str(radius) + file_ending+ "_HJD.dat", "w")
+                 Output_Error = open(save_directory + obj_name + "_" + telescope+ "_" + filt + "_tol" + str(pixthresh) + "_background" + str(background_input) + "_radius" + str(radius) + file_ending+ "_Errors_HJD.dat", "w")
+            else:
+                 Output_Phot = open(save_directory + obj_name + "_" + telescope+ "_" + filt + "_tol" + str(pixthresh) + "_background" + str(background_input) + "_radius" + str(radius) + file_ending+ ".dat", "w")
+                 Output_Error = open(save_directory + obj_name + "_" + telescope+ "_" + filt + "_tol" + str(pixthresh) + "_background" + str(background_input) + "_radius" + str(radius) + file_ending+ "_Errors.dat", "w")
 
             # Create positions in hourangle and degrees for comparison stars
             positions = []
+            
+                        
             for i in range(len(RAs)):
                 if isinstance(RAs[i], str): 
                     positions.append(SkyCoord(ra = RAs[i], dec = Decs[i], frame = FK5, unit = (u.hourangle, u.deg)))
@@ -471,11 +529,11 @@ def AperturePhotometry (thresh, background, radius,
                 
     
             file_counter = 0
-            print("Memory usage at start:")
-            print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            #print("Memory usage at start:")
+            #print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
             for day in sorted(DOO.keys()):
-                print("Memory usage at start of day:")
-                print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                #print("Memory usage at start of day:")
+                #print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
                 
                 Dates_JD = []
                 Dates_HJD = []
@@ -490,30 +548,41 @@ def AperturePhotometry (thresh, background, radius,
     
                 for file in DOO[day]:
                     file_counter += 1
-                    print("Memory usage at start of file:")
-                    print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                    #print("Memory usage at start of file:")
+                    #print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
                     if v:print(str(file_counter)+'/'+str(total_files), "file analyzed in the", filt, "filter")
                     else:
                         if file_counter%25 == 0 or file_counter == total_files:
                             print(str(file_counter)+'/'+str(total_files), "file analyzed in the", filt, "filter")
                     try:
                         Image = fits.open(file) 
-                        print("Memory usage after opening file:")
-                        print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                        #print("Memory usage after opening file:")
+                        #print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
                         LCO = ['up', 'gp', 'rp', 'ip', 'zs']
                         ZW = ['u', 'g', 'r', 'i', 'z']
+                        
+                        
                         if v:print("Telescope:", telescope)
-                        #if telescope == '2m0-01':
+                        
                         #    background = 2
                         if v:print("Opened " + file)
                         w = WCS(file)
+                        if pixscale_found:
+                            pixscale = h_pixscale
+                        else:
+                            pixscale = Image[hi].header[h_pixscale]
+                            print("Got Pixscale using keyword:", h_pixscale)
+                        if filt in LCO:
+                            FWHM_Im = Image[1].header[h_fwhm]/pixscale
+                            w = WCS(Image[1].header)
                         print(w.wcs.ctype)
-                        if w.wcs.ctype[0] == '':
-                            if v:
-                                print(file, 'failed due to no WCS. It must be plate solved before Aperture Photometry can be performed.')
-                            no_wcs_files.append(file)
-                            #total_files -= 1
-                            continue
+                        if filt not in LCO:
+                            if w.wcs.ctype[header_index] == '':
+                                if v:
+                                    print(file, 'failed due to no WCS. It must be plate solved before Aperture Photometry can be performed.')
+                                no_wcs_files.append(file)
+                                #total_files -= 1
+                                continue
                         data = Image[hi].data
                         print(type(Image[hi].header))
                         try:
@@ -531,7 +600,7 @@ def AperturePhotometry (thresh, background, radius,
                             FWHM_Im = FWHM_Im 
                         #Get Exposure of the image
                         Exposure = Image[hi].header[h_exposure]
-                        FWHM_Im_Start = FWHM_Im
+                        #FWHM_Im_Start = FWHM_Im
                         #If supplied a gain, use that value
                         #Otherwise, try to get the gain value
                         
@@ -540,37 +609,70 @@ def AperturePhotometry (thresh, background, radius,
                         else:
                             gain = Image[hi].header[h_gain]
                         
-                            
+                        #Number of files averaged together. If the keyword isnt detected, it just leaves the value as 1, which will do nothing.
+                        #If it does exist, it takes into account the Sqrt(NAVER) factor the errors need to be divided by.
+                        NAVER = 1
+                        try:
+                            NAVER = Image[hi].header['NAVER']
+                        except KeyError:
+                            NAVER = 1
                         #Get the Julian Date
                         JD = Image[hi].header[h_JD]
                         #Get the pixel scale of the image, either if supplied or from the header.
                         #Note, this is in pixels per arcsecond!
-                        if pixscale_found:
-                            pixscale = h_pixscale
-                        else:
-                            pixscale = Image[hi].header[h_pixscale]
-                        if filt in LCO:
-                            FWHM_Im = Image[1].header[h_fwhm]/pixscale
-                            w = WCS(Image[1].header)
+                        
                         if filt in ZW:
                             if JD < date2split:
                                 pixscale = 1.07369 
                             else:
                                 pixscale = 0.895097 #arcsec/pix
+                        #if telescope == '2m0-01':
+                        #    radius = 15
+                        #    r_in = 59
+                        #    r_out = 89
+                        #elif telescope == '1m0-08' or telescope =='1m0-06':
+                        #   radius = 17.7
+                        #    r_in = 46
+                        #    r_out = 69
                         #Convert values 
                         #Values should be given as the number of arcseconds you want them to be
                         #These conversions should convert the number of arcseconds into the pixel scale of the image
+                        """
+                        print("Pixscale:", pixscale)
                         FWHM = radius/pixscale
+                        print("FWHM Pixels:", FWHM)
                         thresh = pixthresh/pixscale
+                        print("Threshold Pixels:", thresh)
                         r_inner = r_in/pixscale
+                        print("Inner Annulus Pixels:", r_inner)
                         r_outer = r_out/pixscale
+                        print("Out Annulus Pixels:", r_outer)
+                        
+                        #This below is the incorrect version!
+                        #Just testing stuff out
+                        """
+                        #print("Pixscale:", pixscale)
+                        #FWHM = radius/pixscale
+                        #thresh = pixthresh/pixscale
+                        #r_inner = r_in/pixscale
+                        #r_outer = r_out/pixscale
+                        
+                        
+                        #Final version:
+                        #print(telescope)
+                        #print('Radius:', radius)
+                        FWHM = radius
+                        thresh = pixthresh
+                        r_inner = r_in
+                        r_outer=r_out
+                        
                         Dates_JD.append(JD)
                         Image.close()
                         if use_HJD:
                             HJD = Image[hi].header[h_HJD]
                             Dates_HJD.append(HJD)
                         if FWHM_Im <= 0 or FWHM_Im >= 100:
-                            if v:print("FWHM is not greater than 1 or larger than 100, file is ignored!")
+                            if v:print("FWHM is not greater than 0 or larger than 100, file is ignored!")
                             no_fwhm_files.append(file)
                             #failed_files.append(file)
                             continue
@@ -597,26 +699,30 @@ def AperturePhotometry (thresh, background, radius,
                         #        FWHM_Im=5
                                 
                         #Get the mean, median, and std of the image
-                        print("Memory usage before sigma_clipped_stats:")
-                        print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-                        mean, median, std = sigma_clipped_stats(data, sigma=5.0, maxiters=5, cenfunc = np.nanmedian, stdfunc = np.nanstd)
-                        print("Memory usage after sigma_clipped_stats:")
-                        print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                        #print("Memory usage before sigma_clipped_stats:")
+                        #print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                        mean, median, std = sigma_clipped_stats(data, sigma=3.0, maxiters=5, cenfunc = np.nanmedian, stdfunc = np.nanstd)
+                        #print("Memory usage after sigma_clipped_stats:")
+                        #print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
                         if filt in LCO:
                             if v:print("LCO!")
                             std = (Image[1].header['L1MEDIAN'] + 0.75*Image[1].header['L1SIGMA'])
+                            if std < 50:
+                                std = 50
                         # finds all stars within image using daofind
                         tries = 0
+                        background = background_input
                         if v:print("Background:", background*std)
+                        if v:print("Image FWHM:", FWHM_Im)
+                        #Found_fluxes, Found_errors = [], []
+                        #for i in range(len(RAs)):
+                        #    Found_fluxes.append([])
+                        #    Found_errors.append([])
+                        
                         while tries < num_tries+1:
                             
-                            Found_fluxes, Found_errors = [], []
-                            for i in range(len(RAs)):
-                                Found_fluxes.append([])
-                                Found_errors.append([])
-                            if v:print("Image FWHM:", FWHM_Im)
-                            print("Memory usage before daofind:")
-                            print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                            #print("Memory usage before daofind:")
+                            #print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
                         
                             daofind = phot.DAOStarFinder(fwhm=FWHM_Im, threshold=(background*std), brightest = total_stars)
                             stars = daofind(data)
@@ -636,8 +742,8 @@ def AperturePhotometry (thresh, background, radius,
                                     daofail.append(file)
                                 break
                             if v:print("Found", len(stars), "stars in image.")
-                            print("Memory usage after daofind:")
-                            print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                            #print("Memory usage after daofind:")
+                            #print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
                             counts, goods = [], []
                             fluxs, coords = [], []
                             
@@ -648,13 +754,15 @@ def AperturePhotometry (thresh, background, radius,
                                 coords.append((0,0))
                                 goods.append(False)
                             #print('Coords', coords)
-                            #skysig - std of the sky. Renaming to match IDL code names                        
+                            #skysig - std of the sky. Renaming to match IDL code names
+                            print('std:',std)
                             skysig = std
                             #variance of the sky
                             skyvar = skysig**2
                             #Difference in areas between outer and inner radii
                             #This is called an annulus
-                            nsky = (r_out**2 - r_in**2)*np.pi
+                            nsky = (r_outer**2 - r_inner**2)*np.pi
+                            print('nsky:', nsky)
                             sigsq = skyvar/nsky
                             #phpadu is the "Photons per analog digital units"
                             #in other words, its the gain of the detector
@@ -664,7 +772,8 @@ def AperturePhotometry (thresh, background, radius,
                             sigsq = skyvar/nsky
                             
                             #area of the aperture
-                            area = np.pi*(radius**2)                       
+                            #FWHM = 5
+                            area = np.pi*(FWHM**2)                       
                             # Performs aperture photometry on all comparison stars
                             if v:print("Performing Aperture Photometry on Object and Stars...")
                             for row in stars:
@@ -685,9 +794,16 @@ def AperturePhotometry (thresh, background, radius,
                                             aperture = phot.CircularAperture(Coord, r = FWHM)
                                             annulus = CircularAnnulus(Coord, r_in=r_inner, r_out=r_outer)
                                             #Creates a mask and applies it to the data
+                                            #Essentially, the 'mask' is the area created by the annuli
+                                            #This code creates it geometrically
                                             mask = annulus.to_mask(method='center')
+                                            #This code then applies the mask to the actual data, thus filling in the geometry with actual usable data
                                             aper_data = mask.multiply(data)
+                                            #Lastly, makes the data 1-d, i.e. a simple list. This gets rid of information regarding its position, but we don't
+                                            #really care about the RA and Dec of each pixel - we just want the median values, so a list will do.
+                                            #There is also a check that prevents it from taking values less than 0.
                                             aper_data_1d = aper_data[mask.data > 0]
+                                            std2 = np.std(aper_data_1d)
                                             # Calculates median background value within annulus
                                             bkg_median = np.median(aper_data_1d)
                                             # Creates a table with photometry 
@@ -709,23 +825,72 @@ def AperturePhotometry (thresh, background, radius,
                                             (3) the uncertainty of the mean sky brightness (this standard error
                                             increases directly with the area of the aperture).
                                             """
-                                            
-                                            error1 = area * skyvar 
+                                            #print("Area", area)
+                                            #print("Sky Variability:", skyvar)
+                                            #error1 = aperture.area * skyvar 
+                                            #print('apmag:', apmag)
+                                            #print("phpadu:", phpadu)
                                             error2 = apmag/phpadu
-                                            error3 = sigsq*(area**2)
-                                            Error_Source = math.sqrt(error1 + error2 + error3)/Exposure
+                                            #print('sigsq:', sigsq)
+                                            #print('area:', aperture.area)
+                                            #error3 = sigsq*(aperture.area**2)
+                                            #Error_Source = math.sqrt(error1 + error2 + error3)/Exposure
+                                            #print('error1:', error1)
+                                            #print('error2:', error2)
+                                            #print('error3:', error3)
+                                            #print(thing, ' Total Errors on Counts:')
+                                            #print("sqrt total:", math.sqrt(error1 + error2 + error3))
+                                            #print("error count:", Error_Source)
+                                            #Second attempt errors, done with taking the std of only the annulus
+                                            error1_2 = aperture.area*(std2**2)
+                                            error3_2 = (aperture.area**2)*(std2**2)/nsky
+                                            Error_Source = math.sqrt(error1_2 + error2 + error3_2)/Exposure
+                                            #Error_Source = math.sqrt(error1_2 + error2 + error3_2)
+                                            #print('Error1_2:',error1_2)
+                                            #print("Error3_2:", error3_2)
+                                            #Third attempt errors, done with a new algorithm that Ed uses
+                                            #sigma_clip = SigmaClip(sigma=3.0)
+                                            #bkgrms
+                                            #bkg = MMMBackground(sigma_clip = sigma_clip)
+                                            #bkg_value = bkg.calc_background(std2)
+                                            #std3 = np.std()
+                                            #error1_3 = aperture.area*(bkg_value**2)
+                                            #error3_3 = (aperture.area**2)*(bkg_value**2)/nsky
+                                            #print()
+                                            #print('Error1_3:',error1_3)
+                                            #print("Error3_3:", error3_3)
+                                            
+                                            
+                                            
                                             #print(error1, error2, error3, Error_Source)
                                             #Save errors
                                             Found_errors[i].append(Error_Source)
                                             #Get FLUX RATE, which is the flux divided by the exposure, to get units into counts/sec
                                             Flux = phot_table['residual_aperture_sum'][0] / Exposure
+                                            #Flux = phot_table['residual_aperture_sum'][0]
                                             if v:print("Flux:", Flux)
                                             #Saves our fluxes where they need to be saved
                                             fluxs[i] = Flux
+                                            #if tries > 0:
+                                            #    if len(Found_fluxes[i]) == 0:
+                                            #        Found_fluxes[i].append(Flux)
+                                            #    else:
+                                            #        Found_fluxes[i][DOO[day].index(file)] = Flux
+                                            #else:
                                             Found_fluxes[i].append(Flux)
+                                            print("Found_fluxes")
+                                            print(Found_fluxes)
                                             #Increases the number of counts for this object (defined by 'i') by 1.
                                             counts[i] += 1
                                             #Checks to see if it is an invalid value
+                                            #print()
+                                            #print(thing, "Counts:")
+                                            #print(Flux * Exposure)
+                                            
+                                            #print(thing, ' Total Errors on Counts:')
+                                            #print("sqrt total:", math.sqrt(error1 + error2 + error3))
+                                            #print("New sqrt total:", math.sqrt(error1_2 + error2 + error3_2))
+                                            #print()
                                             if math.isnan(Flux) == False:
                                                 goods[i] = True
                                                 if v:print("Found " + thing + " Flux.")
@@ -748,17 +913,20 @@ def AperturePhotometry (thresh, background, radius,
                                 #Plot the found stars
                                 print(coords)
                                 star_positions = coords
-                                apertures = CircularAperture(star_positions, r=8)
+                                apertures = CircularAperture(star_positions, r=FWHM)
                                 apertures.plot(color='red', lw=2, alpha=1)
+                                inner_annulus = CircularAperture(star_positions, r = r_inner)
+                                outer_annulus = CircularAperture(star_positions, r = r_outer)
+                                inner_annulus.plot(color = 'yellow', lw=2, alpha=1)
+                                outer_annulus.plot(color = 'green', lw = 2, alpha=1)
                                 
                             #This code checks to see if any of the objects had multiple detections
                             #If they did, it marks the day as bad. Since Multistar is caught at the star detection phase, it is already recorded there,
                             #and does not need to be put back into any list
-                            print("Memory usage after finding fluxes:")
-                            print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                            #print("Memory usage after finding fluxes:")
+                            #print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
                             #Looks through the saved multistar list to see if the object raised any flags
                             bad_multistar, bad_nostar = False, False
-                            good_check = False
                             for i in range(len(multistar)):
                                 if file in multistar[i]:
                                     if i == 0:
@@ -781,8 +949,12 @@ def AperturePhotometry (thresh, background, radius,
                                     
                            #If anything was raised from the checks (the good value is False for a star/object), exclude the file from the aperture photometry
                             if False in goods:
+                                for i in range(len(Found_fluxes)):
+                                    if fluxs[i] in Found_fluxes[i]:
+                                        Found_fluxes[i].remove(fluxs[i])
+                                    print(Found_fluxes)
                                 tries += 1
-                                if v:print("Failed to pass the good check.")
+                                #if v:print("Failed to pass the good check.")
                                 if bad_nostar == True:
                                     if v:print("Failed due to a non-detection of comparison star/object.")
                                     FWHM_Im +=2
@@ -805,6 +977,8 @@ def AperturePhotometry (thresh, background, radius,
                             #If all objects return True, it passes the good check
                             else:
                                 if v:print("Passed the Good File Check.")
+                                print("Found Fluxes")
+                                print(Found_fluxes)
                                 tries = num_tries +1
                                 Image_list.append(file)
                                 good_files.append(file)
@@ -833,6 +1007,9 @@ def AperturePhotometry (thresh, background, radius,
                 print("Memory usage after badfiles finder:")
                 print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
                 #If all files for a date fail, it let's you know. Otherwise, it starts calculating the Normalixed flux rates
+                print("Found Fluxes:")
+                print(Found_fluxes)
+                #Checks Found Fluxes to see if all the data has been removed. If it has, then it discards the days' observations
                 if len(Found_fluxes[0]) == 0:
                     if v:print("All files for this day (" +day+") of observations have been removed due to bad data.")
                     failed_epochs.append(day)
@@ -860,12 +1037,19 @@ def AperturePhotometry (thresh, background, radius,
                                 Squares[i] = [j ** 2 for j in Found_errors[i]]
                                 Sum_Errors.append(sum(Squares[i]))
                                 Average_Errors.append(round(math.sqrt(Sum_Errors[i])/ len(Image_list), 3))
+                            #Process the NAVER term
+                            print("NAVER:", NAVER)
+                            print("Mean Err Before NAVER:", np.mean(Average_Errors))
+                            for i in range(len(Average_Errors)):
+                                Average_Errors[i] = Average_Errors[i]/np.sqrt(NAVER)
                             #Get average date. At this point we know we have passed all possible checks, so increase the total epochs by 1
+                            print("Mean Err After NAVER:", np.mean(Average_Errors))
                             Avg_Date = round(sum(Dates_JD) / len(Dates_JD), 3)
                             epochs += 1
                             #Save in what time system you want
                             if save:
                                 if use_HJD:
+                                    print('Used HJD!!')
                                     Avg_Date_HJD = round(sum(Dates_HJD) / len(Dates_HJD), 3)
                                     print(Avg_Date_HJD, *Averages, file = Output_Phot)
                                     print(Avg_Date_HJD, *Average_Errors, file = Output_Error)
@@ -877,15 +1061,14 @@ def AperturePhotometry (thresh, background, radius,
                                 if v:print("*********************************************")
                                 if v:print("                 DATA SAVED!                 ")
                                 if v:print("*********************************************")
-                                #for i in range(0, 10):
-                                #    print("DATA SAVED")
+
                     #What does this do? I don't think this is necessary anymore.
                     except NotADirectoryError:
                         if v:print("DATA NOT SAVED DUE TO FILE BEING A DIRECTORY")
                         failed_files.append(file)
                         pass
-                print("Memory usage after photometry:")
-                print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                #print("Memory usage after photometry:")
+                #print('%s (kb)' % resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
             #Saves the total file diagnostics from a single filter to the 'filter lists'
             #This allows us to save their data and reset the others for the next filter
             total_files_perfilter.append(total_files)
@@ -939,7 +1122,12 @@ def AperturePhotometry (thresh, background, radius,
         for i in range(len(total_files_pertelescope)):
             #print("Telescope:", telescope_name_list[i], file = save_path)
             for j in range(len(total_files_pertelescope[i])):
-                save_path = open(save_directory + obj_name + "_" + telescope_name_list[i] + "_" + filter_list[j] + "_tol" + str(pixthresh) + "_background" +str(background)+ "_radius" + str(radius) + "_usage_results.dat", "w")
+                if telescope_name_list[i] == '2m0-01':
+                    radius = radius_2m
+                elif telescope_name_list[i] == '1m0-08' or telescope_name_list[i] =='1m0-06':
+                    radius = radius_1m
+
+                save_path = open(save_directory + obj_name + "_" + telescope_name_list[i] + "_" + filter_list[j] + "_tol" + str(pixthresh) + "_background" +str(background_input)+ "_radius" + str(radius) + "_usage_results.dat", "w")
                 print("Telescope:", telescope_name_list[i], file = save_path)
                 print("Filter:", filter_list[j], file = save_path)
                 print("Used Observation Epochs:",epochs_pertelescope[i][j], file = save_path)
@@ -964,15 +1152,28 @@ def AperturePhotometry (thresh, background, radius,
                 if len(runtimeerror_pertelescope[i][j])>0:print(runtimeerror_pertelescope[i][j], file = save_path)
                 print("No WCS (Not Included in Total):", len(no_wcs_pertelescope[i][j]), file = save_path)
                 if len(no_wcs_pertelescope[i][j])>0: print(no_wcs_pertelescope[i][j], file=save_path)
-                print()
+                print('', file = save_path)
+                print("Stars Used:", save_path)
+                for k in range(len(RA_list)):
+                    if k == 0: 
+                        print("Object:", file = save_path)
+                        print("RA:", RA_list[k], file = save_path)
+                        print("Dec:", Dec_list[k], file = save_path)
+                    else: 
+                        print("Star " + str(k+1) + ': ', file = save_path)
+                        print("RA: ", RA_list[k], file = save_path)
+                        print("Dec: ", Dec_list[k], file = save_path)
+                print( '', file = save_path)
                 print("Multiple Detections:", file = save_path)
                 failed_mult= []
                 for k in range(len(mult_pertelescope[i][j])):
                     if k==0: thing = 'Object:'
                     else: thing = 'Star ' + str(k) + ':'
+                    
                     for l in range(len(mult_pertelescope[i][j][k])):
                         if mult_pertelescope [i][j][k][l] not in failed_mult: failed_mult.append(mult_pertelescope[i][j][k][l])
                     print(thing, len(mult_pertelescope[i][j][k]), file = save_path)
+                    
                     if len(mult_pertelescope[i][j][k])>0: print(mult_pertelescope[i][j][k], file=save_path)
                 print("Unique failed files:", len(failed_mult), file=save_path)
                 failed_nostar = []
@@ -1041,6 +1242,8 @@ def AperturePhotometry (thresh, background, radius,
             for k in range(len(mult_pertelescope[i][j])):
                 if k==0: thing = 'Object:'
                 else: thing = 'Star ' + str(k) + ':'
+                print("RA:", RA_list[k])
+                print("Dec:", Dec_list[k])
                 for l in range(len(mult_pertelescope[i][j][k])):
                     if mult_pertelescope [i][j][k][l] not in failed_mult: failed_mult.append(mult_pertelescope[i][j][k][l])
                 print(thing, len(mult_pertelescope[i][j][k]),)
